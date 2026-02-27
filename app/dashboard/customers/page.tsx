@@ -8,7 +8,7 @@ export const dynamic = 'force-dynamic'
 
 export default async function CustomersPage() {
   const cookieStore = await cookies()
-  const fxMode = (cookieStore.get('fx_mode')?.value ?? 'live') as FxMode
+  const fxMode = (cookieStore.get('fx_mode')?.value ?? 'stripe_dashboard') as FxMode
   const fxRate = await getEffectiveFxRate(fxMode)
 
   const [customers, kpis] = await Promise.all([getTopCustomers(50, fxRate), getKpis(fxRate)])
@@ -29,7 +29,7 @@ export default async function CustomersPage() {
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <KpiCard label="Total Customers" value={customers.length.toString()} icon="◎" />
+        <KpiCard label="Total Customers" value={kpis.activeSubscriptions.toString()} icon="◎" />
         <KpiCard label="Total ARR" value={formatCad(kpis.arr)} accent="positive" icon="▲" />
         <KpiCard
           label="Top 5 ARR Share"
