@@ -31,9 +31,15 @@ export function proxy(req: NextRequest) {
     if (fail) return fail
   }
 
+  // Protect internal Stripe API routes (debug endpoints, raw data)
+  if (pathname.startsWith('/api/stripe')) {
+    const fail = checkBasicAuth(req, process.env.INTERNAL_PASSWORD ?? '', 'Vome Internal')
+    if (fail) return fail
+  }
+
   return NextResponse.next()
 }
 
 export const config = {
-  matcher: ['/dashboard/:path*', '/investor/:path*'],
+  matcher: ['/dashboard/:path*', '/investor/:path*', '/api/stripe/:path*'],
 }
