@@ -45,7 +45,7 @@ export default async function DashboardPage() {
     <div className="flex flex-col gap-6 max-w-7xl mx-auto">
       {/* Header */}
       <div>
-        <h1 className="text-2xl font-bold text-slate-100">Financial Overview</h1>
+        <h1 className="text-2xl font-bold text-slate-100">Financial Overview </h1>
         {/* <p className="text-sm text-slate-500 mt-0.5">
           All figures in CAD
         </p> */}
