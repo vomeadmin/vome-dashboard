@@ -8,7 +8,7 @@ export const dynamic = 'force-dynamic'
 
 export default async function CustomersPage() {
   const cookieStore = await cookies()
-  const fxMode = (cookieStore.get('fx_mode')?.value ?? 'stripe_dashboard') as FxMode
+  const fxMode = (cookieStore.get('fx_mode')?.value ?? 'stripe_api') as FxMode
   const fxRate = await getEffectiveFxRate(fxMode)
 
   const [customers, kpis] = await Promise.all([getTopCustomers(50, fxRate), getKpis(fxRate)])

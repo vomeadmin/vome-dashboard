@@ -1,7 +1,7 @@
 import { getKpis, getUpcomingRenewals, getNormalizedMrrByMonth, getChurnedDowngrades, getTopCustomers } from '@/lib/stripe-calculations'
 import { getCashFlowForecast } from '@/lib/stripe-forecast'
 import { cookies } from 'next/headers'
-import { formatCad, getEffectiveFxRate, type FxMode, FX_MODE_LABELS } from '@/lib/fx'
+import { formatCad, getEffectiveFxRate, type FxMode } from '@/lib/fx'
 import { KpiCard } from '@/components/ui/KpiCard'
 import { RenewalTimeline } from '@/components/ui/RenewalTimeline'
 import { CustomerTable } from '@/components/ui/CustomerTable'
@@ -30,6 +30,14 @@ export default async function DashboardPage() {
       getChurnedDowngrades(thirtyDaysAgo, fxRate),
     ])
 
+  // Override current month with the KPI MRR (getKpis uses the accurate path: tiered pricing,
+  // unit_amount_decimal fallback, and discount coupons). getNormalizedMrrByMonth uses a simpler
+  // historical snapshot approach that misses these — so the last bucket would otherwise show a
+  // different number than the KPI card.
+  if (mrrTrend.length > 0) {
+    mrrTrend[mrrTrend.length - 1] = { ...mrrTrend[mrrTrend.length - 1], mrr: kpis.mrr }
+  }
+
   const churnCount = churnedDowngrades.length
   const arrLostToChurn = churnedDowngrades.reduce((sum: number, c) => sum + c.arrLostCad, 0)
 
@@ -49,6 +57,7 @@ export default async function DashboardPage() {
           label="MRR"
           value={formatCad(kpis.mrr)}
           subValue="Monthly Recurring Revenue"
+          note={kpis.trialingSubscriptions > 0 ? `+ ${formatCad(kpis.trialingMrr)} pipeline (${kpis.trialingSubscriptions} trials, excl. above)` : undefined}
           accent="default"
           icon="◈"
         />
@@ -56,6 +65,7 @@ export default async function DashboardPage() {
           label="ARR"
           value={formatCad(kpis.arr)}
           subValue="Annual Recurring Revenue"
+          note={kpis.trialingSubscriptions > 0 ? `+ ${formatCad(kpis.trialingArr)} pipeline (${kpis.trialingSubscriptions} trials, excl. above)` : undefined}
           accent="positive"
           icon="▲"
         />
@@ -119,6 +129,14 @@ export default async function DashboardPage() {
         </div>
         <ActivityPanel />
       </div>
+
+      {/* FX calibration footer — internal only. Shows native currency breakdown so you can
+          back-calculate Stripe's internal FX rate when numbers drift:
+          new rate = (Stripe dashboard MRR − CAD native) ÷ USD native
+          Then update STRIPE_DASHBOARD_FX_RATE in .env.local */}
+      <p className="text-xs text-slate-700 text-right">
+        CAD base: {formatCad(kpis.mrrCadNative)} · USD base: {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(kpis.mrrUsdNative)} · Rate: {fxRate.toFixed(4)}
+      </p>
     </div>
   )
 }

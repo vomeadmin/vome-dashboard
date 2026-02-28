@@ -18,10 +18,10 @@ export const PLAN_MAP: Record<string, PlanTier> = {
 }
 
 export const PLAN_COLORS: Record<PlanTier, string> = {
-  Free: '#64748b',
-  Pro: '#3b82f6',
-  Enterprise: '#8b5cf6',
-  Ultimate: '#f59e0b',
+  Free:       '#fa935b',  // orange  — Recruit / Free
+  Pro:        '#22c55e',  // green   — Pro
+  Enterprise: '#3b82f6',  // blue    — Enterprise
+  Ultimate:   '#a78bfa',  // purple  — Ultimate
 }
 
 export const PLAN_ORDER: PlanTier[] = ['Ultimate', 'Enterprise', 'Pro', 'Free']

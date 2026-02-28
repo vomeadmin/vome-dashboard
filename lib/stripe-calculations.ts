@@ -2,6 +2,7 @@ import Stripe from 'stripe'
 import { stripe } from './stripe'
 import { getUsdToCadRate } from './fx'
 import { getPlanFromProduct, type PlanTier, PLAN_ORDER } from './plan-config'
+import { INTERNAL_CUSTOMER_IDS } from './internal-accounts'
 
 export interface SubscriptionData {
   id: string
@@ -34,8 +35,10 @@ export interface KpiData {
   mrr: number
   arr: number
   activeSubscriptions: number
-  trialingSubscriptions: number  // included in MRR, like Stripe
-  pastDueSubscriptions: number   // included in MRR, like Stripe
+  trialingSubscriptions: number  // NOT in MRR — shown as pipeline note
+  pastDueSubscriptions: number   // INCLUDED in MRR — offline payments accepted
+  trialingMrr: number  // MRR from trialing subs — already included in mrr total (Stripe methodology)
+  trialingArr: number  // ARR from trialing subs — already included in arr total (Stripe methodology)
   avgArrPerCustomer: number
   totalSeats: number
   byPlan: Record<PlanTier, PlanSummary>
@@ -59,96 +62,318 @@ export interface CustomerData {
   subscriptionId: string
 }
 
+// ---------------------------------------------------------------------------
+// Module-level TTL cache — prevents redundant Stripe API calls when multiple
+// functions (getKpis, getTopCustomers, getUpcomingRenewals) run in parallel
+// on the same page load. Serverless instances may be reused, so we keep
+// financial data fresh with a short 60-second TTL.
+// ---------------------------------------------------------------------------
+interface SubsCache {
+  data: SubscriptionData[]
+  fxRate: number
+  ts: number
+}
+let _subsCache: SubsCache | null = null
+const SUBS_CACHE_TTL_MS = 60_000
+
 /**
- * Fetches active, trialing, and past_due subscriptions with customer and product details expanded.
- * Matches Stripe's own MRR methodology: Stripe includes all three statuses in their MRR figure.
- * Accepts an optional fxRate; if omitted, fetches the live ECB rate.
+ * Resolves the annual value (in native currency cents) for a single subscription item.
+ *
+ * Three fixes vs naive approach:
+ * 1. unit_amount_decimal fallback — some custom prices have non-integer amounts (e.g. Sport Yukon
+ *    at $952.381/seat/yr). Stripe stores these in unit_amount_decimal; unit_amount is null.
+ * 2. Tiered pricing tiers — Stripe does NOT include the tiers[] array when a Price is embedded
+ *    in a subscription list expansion. We fetch them separately (see fetchByStatus) and pass
+ *    them in via the tieredPrices cache.
+ * 3. Volume tier flat_amount — a volume tier can have both a unit_amount (per seat) AND a
+ *    flat_amount (once per billing period). Both must be included in the charge calculation.
  */
-export async function getActiveSubscriptions(fxRate?: number): Promise<SubscriptionData[]> {
-  const rate = fxRate ?? await getUsdToCadRate()
-  const results: SubscriptionData[] = []
+function resolveItemAnnualCents(
+  price: Stripe.Price,
+  seats: number,
+  monthsInPeriod: number,
+  tieredPrices: Map<string, Stripe.Price>
+): number {
+  const billing = price.billing_scheme
 
-  for await (const sub of stripe.subscriptions.list({
-    status: 'all',
-    limit: 100,
-    // Max expand depth is 4 levels. data.items.data.price.product would be 5 — not allowed.
-    // We expand to price only; product comes back as a string ID, which is enough for PLAN_MAP lookup.
-    expand: ['data.customer', 'data.items.data.price'],
-  })) {
-    // Match Stripe's MRR: include active, trialing, and past_due; skip everything else
-    if (!['active', 'trialing', 'past_due'].includes(sub.status)) continue
+  // Resolve tiers: use the cached version if available (it has tiers data; the embedded one doesn't)
+  const resolvedPrice = tieredPrices.get(price.id) ?? price
+  const tiers = resolvedPrice.tiers
 
-    const customer = sub.customer as Stripe.Customer
-    if (!sub.items.data.length) continue
+  if (billing === 'tiered' && tiers && tiers.length > 0) {
+    let periodChargeCents = 0
 
-    const currency = sub.currency
-
-    // Aggregate ARR/seats across ALL line items in the subscription.
-    // Some subscriptions have multiple items (e.g. base plan + extra seat add-ons billed separately).
-    let totalArrNative = 0
-    let totalSeats = 0
-    let primaryPlan: PlanTier = 'Free'
-    let primaryItem = sub.items.data[0]
-
-    for (const item of sub.items.data) {
-      const price = item.price
-      const productId = typeof price.product === 'string' ? price.product : (price.product as Stripe.Product)?.id ?? null
-      const seats = item.quantity ?? 1
-      const unitPriceCents = price.unit_amount ?? 0
-      const interval = (price.recurring?.interval ?? 'month') as 'month' | 'year'
-      const intervalCount = price.recurring?.interval_count ?? 1
-
-      // Normalize to annual value in native currency.
-      // monthsInPeriod handles all billing cadences:
-      //   monthly (interval=month, count=1)  → 1 month/period  → ×12
-      //   quarterly (interval=month, count=3) → 3 months/period → ×4
-      //   annual (interval=year, count=1)    → 12 months/period → ×1
-      //   biennial (interval=year, count=2)  → 24 months/period → ×0.5
-      const monthsInPeriod = interval === 'year' ? 12 * intervalCount : intervalCount
-      const annualValueNative = (unitPriceCents / 100) * seats * (12 / monthsInPeriod)
-
-      totalArrNative += annualValueNative
-      // Only count seats for paid line items — $0 add-ons (e.g. free seat grants) are excluded
-      if (unitPriceCents > 0) totalSeats += seats
-
-      // Use the highest-tier plan found across all items
-      const itemPlan = getPlanFromProduct(productId, null)
-      if (PLAN_ORDER.indexOf(itemPlan) < PLAN_ORDER.indexOf(primaryPlan)) {
-        primaryPlan = itemPlan
-        primaryItem = item
+    if (resolvedPrice.tiers_mode === 'volume') {
+      // Volume: all units priced at the tier the total quantity falls into.
+      // The tier also has an optional flat_amount charged once per period.
+      for (const tier of tiers) {
+        if (tier.up_to === null || tier.up_to >= seats) {
+          periodChargeCents = (tier.unit_amount ?? 0) * seats + (tier.flat_amount ?? 0)
+          break
+        }
+      }
+    } else {
+      // Graduated: units priced at different rates as they cross tier boundaries.
+      // flat_amount applies each time a tier boundary is crossed.
+      let prevUpTo = 0
+      let remaining = seats
+      for (const tier of tiers) {
+        const tierCapacity = tier.up_to === null ? remaining : (tier.up_to - prevUpTo)
+        const tierUnits = Math.min(tierCapacity, remaining)
+        periodChargeCents += (tier.unit_amount ?? 0) * tierUnits + (tier.flat_amount ?? 0)
+        remaining -= tierUnits
+        prevUpTo = tier.up_to ?? seats
+        if (remaining <= 0) break
       }
     }
 
-    // Use the primary item's price metadata for display fields (interval, unitPrice)
-    const primaryPrice = primaryItem.price
-    const primaryInterval = (primaryPrice.recurring?.interval ?? 'month') as 'month' | 'year'
-    const primaryIntervalCount = primaryPrice.recurring?.interval_count ?? 1
-    const primaryUnitCents = primaryPrice.unit_amount ?? 0
-
-    const arrCad = currency === 'usd' ? totalArrNative * rate : totalArrNative
-
-    results.push({
-      id: sub.id,
-      customerId: typeof sub.customer === 'string' ? sub.customer : customer.id,
-      customerName: customer.name ?? customer.email ?? 'Unknown',
-      customerEmail: customer.email ?? '',
-      status: sub.status,
-      plan: primaryPlan,
-      seats: totalSeats,
-      unitPriceCents: primaryUnitCents,
-      interval: primaryInterval,
-      intervalCount: primaryIntervalCount,
-      currency,
-      // In Stripe SDK v20+, current_period_end moved from Subscription to SubscriptionItem
-      currentPeriodEnd: new Date((primaryItem.current_period_end ?? sub.billing_cycle_anchor) * 1000),
-      arrCad,
-      mrrCad: arrCad / 12,
-      arrNative: totalArrNative,
-      nativeCurrency: currency.toUpperCase(),
-    })
+    // periodChargeCents is per billing period → normalize to annual
+    return periodChargeCents * (12 / monthsInPeriod)
   }
 
+  // Per-unit pricing. unit_amount is the integer version; unit_amount_decimal holds decimal
+  // precision for non-round amounts (e.g. $952.381/yr). Use whichever is available.
+  const unitCents =
+    price.unit_amount ??
+    (price.unit_amount_decimal ? Math.round(parseFloat(price.unit_amount_decimal)) : 0)
+
+  return unitCents * seats * (12 / monthsInPeriod)
+}
+
+/**
+ * Processes a single raw Stripe subscription into a SubscriptionData record.
+ * Returns null if the subscription has no line items.
+ * tieredPrices: pre-fetched Price objects (with tiers expanded)
+ * coupons: pre-fetched Coupon objects for any discount coupons on this subscription
+ */
+function processSubscription(
+  sub: Stripe.Subscription,
+  rate: number,
+  tieredPrices: Map<string, Stripe.Price>,
+  coupons: Map<string, Stripe.Coupon>
+): SubscriptionData | null {
+  const customer = sub.customer as Stripe.Customer
+  if (!sub.items.data.length) return null
+
+  const currency = sub.currency
+  let totalArrNative = 0
+  let totalSeats = 0
+  let primaryPlan: PlanTier = 'Free'
+  let primaryItem = sub.items.data[0]
+
+  for (const item of sub.items.data) {
+    const price = item.price
+    const productId = typeof price.product === 'string' ? price.product : (price.product as Stripe.Product)?.id ?? null
+    const seats = item.quantity ?? 1
+    const interval = (price.recurring?.interval ?? 'month') as 'month' | 'year'
+    const intervalCount = price.recurring?.interval_count ?? 1
+
+    // monthsInPeriod handles all billing cadences:
+    //   monthly (interval=month, count=1)  → 1 month/period  → ×12
+    //   quarterly (interval=month, count=3) → 3 months/period → ×4
+    //   annual (interval=year, count=1)    → 12 months/period → ×1
+    //   3-year (interval=year, count=3)    → 36 months/period → ×(12/36)
+    const monthsInPeriod = interval === 'year' ? 12 * intervalCount : intervalCount
+
+    const itemAnnualCents = resolveItemAnnualCents(price, seats, monthsInPeriod, tieredPrices)
+    const itemArrNative = itemAnnualCents / 100
+
+    totalArrNative += itemArrNative
+    // Only count seats for paid line items — $0 add-ons (e.g. free seat grants) are excluded
+    if (itemAnnualCents > 0) totalSeats += seats
+
+    // Use the highest-tier plan found across all items
+    const itemPlan = getPlanFromProduct(productId, null)
+    if (PLAN_ORDER.indexOf(itemPlan) < PLAN_ORDER.indexOf(primaryPlan)) {
+      primaryPlan = itemPlan
+      primaryItem = item
+    }
+  }
+
+  // Apply discount coupons to match Stripe's MRR CSV methodology:
+  //
+  // Rule 1 — PERMANENT ONLY: Stripe includes only forever/permanent coupons in MRR.
+  //   Time-limited promotions (discount.end !== null) affect invoice amounts but Stripe
+  //   treats the undiscounted subscription price as the committed MRR value.
+  //
+  // Rule 2 — CUSTOMER-LEVEL fallback: some permanent coupons live on customer.discount
+  //   rather than sub.discounts (Stripe doesn't always propagate them to the sub object).
+  //   We check both sources and deduplicate by coupon ID.
+  //
+  // - percent_off: scales the whole ARR (e.g. 50% off → arr * 0.5)
+  // - amount_off: per-billing-period discount in smallest currency unit, annualized.
+  //   We apply the FIRST valid permanent coupon found.
+  const discounts = sub.discounts as Stripe.Discount[] | undefined
+
+  // Collect candidate discount sources: sub.discounts first, then customer.discount
+  type DiscountSource = { couponId: string; end: number | null }
+  const discountSources: DiscountSource[] = []
+  const seenCouponIds = new Set<string>()
+
+  if (discounts?.length) {
+    for (const d of discounts) {
+      const src = (d as { source?: { type?: string; coupon?: string } }).source
+      const couponId = src?.type === 'coupon' ? src.coupon : undefined
+      if (couponId && !seenCouponIds.has(couponId)) {
+        seenCouponIds.add(couponId)
+        discountSources.push({ couponId, end: (d as { end?: number | null }).end ?? null })
+      }
+    }
+  }
+  // customer.discount: permanent coupons not always propagated to sub.discounts
+  const custDiscount = (sub.customer as Stripe.Customer)?.discount as (Stripe.Discount & { source?: { type?: string; coupon?: string } }) | null
+  if (custDiscount?.source?.type === 'coupon' && custDiscount.source.coupon) {
+    const couponId = custDiscount.source.coupon
+    if (!seenCouponIds.has(couponId)) {
+      seenCouponIds.add(couponId)
+      discountSources.push({ couponId, end: custDiscount.end ?? null })
+    }
+  }
+
+  // Apply the first permanent (end === null) valid coupon found
+  for (const { couponId, end } of discountSources) {
+    if (end !== null) continue  // skip time-limited promotions — Stripe excludes these from MRR
+    const coupon = coupons.get(couponId)
+    if (!coupon || coupon.valid === false) continue
+    if (coupon.percent_off != null) {
+      totalArrNative *= (1 - coupon.percent_off / 100)
+    } else if (coupon.amount_off != null) {
+      // amount_off is in smallest currency unit, applied once per billing period.
+      // We use the primary item's interval to annualize it.
+      const primaryInterval2 = (primaryItem.price.recurring?.interval ?? 'month') as 'month' | 'year'
+      const primaryIntervalCount2 = primaryItem.price.recurring?.interval_count ?? 1
+      const primaryMonthsInPeriod = primaryInterval2 === 'year' ? 12 * primaryIntervalCount2 : primaryIntervalCount2
+      const annualDiscountNative = (coupon.amount_off / 100) * (12 / primaryMonthsInPeriod)
+      totalArrNative = Math.max(0, totalArrNative - annualDiscountNative)
+    }
+    break  // only apply one coupon per subscription
+  }
+
+  const primaryPrice = primaryItem.price
+  const primaryInterval = (primaryPrice.recurring?.interval ?? 'month') as 'month' | 'year'
+  const primaryIntervalCount = primaryPrice.recurring?.interval_count ?? 1
+  const primaryUnitCents = primaryPrice.unit_amount ?? 0
+  const arrCad = currency === 'usd' ? totalArrNative * rate : totalArrNative
+
+  return {
+    id: sub.id,
+    customerId: typeof sub.customer === 'string' ? sub.customer : customer.id,
+    customerName: customer.name ?? customer.email ?? 'Unknown',
+    customerEmail: customer.email ?? '',
+    status: sub.status,
+    plan: primaryPlan,
+    seats: totalSeats,
+    unitPriceCents: primaryUnitCents,
+    interval: primaryInterval,
+    intervalCount: primaryIntervalCount,
+    currency,
+    // In Stripe SDK v20+, current_period_end moved from Subscription to SubscriptionItem
+    currentPeriodEnd: new Date((primaryItem.current_period_end ?? sub.billing_cycle_anchor) * 1000),
+    arrCad,
+    mrrCad: arrCad / 12,
+    arrNative: totalArrNative,
+    nativeCurrency: currency.toUpperCase(),
+  }
+}
+
+/**
+ * Fetches one specific subscription status and processes all results.
+ * Handles three Stripe API quirks:
+ * - tiers[] is not included in the price embedded in subscription expansions → fetched separately
+ * - unit_amount_decimal (used for non-integer prices) handled in resolveItemAnnualCents
+ * - discount coupons (percent_off / amount_off) must be fetched separately and applied to ARR
+ */
+async function fetchByStatus(
+  status: 'active' | 'trialing' | 'past_due',
+  rate: number
+): Promise<SubscriptionData[]> {
+  // Step 1: collect all raw subscriptions for this status, including discount info
+  const rawSubs: Stripe.Subscription[] = []
+  for await (const sub of stripe.subscriptions.list({
+    status,
+    limit: 100,
+    expand: ['data.customer', 'data.items.data.price', 'data.discounts'],
+  })) {
+    rawSubs.push(sub)
+  }
+
+  // Step 2: collect IDs that need separate fetches:
+  //   a) tiered price IDs (Stripe omits tiers[] from embedded prices)
+  //   b) coupon IDs from sub.discounts AND from customer.discount (customer-level permanent discounts)
+  const tieredPriceIds = new Set<string>()
+  const couponIds = new Set<string>()
+  for (const sub of rawSubs) {
+    for (const item of sub.items.data) {
+      if (item.price.billing_scheme === 'tiered' && !item.price.tiers?.length) {
+        tieredPriceIds.add(item.price.id)
+      }
+    }
+    // Coupon IDs from subscription-level discounts
+    const discounts = sub.discounts as Stripe.Discount[] | undefined
+    if (discounts) {
+      for (const d of discounts) {
+        const src = (d as { source?: { type?: string; coupon?: string } }).source
+        if (src?.type === 'coupon' && src.coupon) couponIds.add(src.coupon)
+      }
+    }
+    // Coupon IDs from customer-level discount (lives on customer object, not always in sub.discounts)
+    const customer = sub.customer as Stripe.Customer
+    const custDiscount = customer?.discount as (Stripe.Discount & { source?: { type?: string; coupon?: string } }) | null
+    if (custDiscount?.source?.type === 'coupon' && custDiscount.source.coupon) {
+      couponIds.add(custDiscount.source.coupon)
+    }
+  }
+
+  // Step 3: parallel fetch of tiered prices + coupons
+  const tieredPrices = new Map<string, Stripe.Price>()
+  const coupons = new Map<string, Stripe.Coupon>()
+  await Promise.all([
+    ...Array.from(tieredPriceIds).map(async (priceId) => {
+      const price = await stripe.prices.retrieve(priceId, { expand: ['tiers'] })
+      tieredPrices.set(priceId, price)
+    }),
+    ...Array.from(couponIds).map(async (couponId) => {
+      const coupon = await stripe.coupons.retrieve(couponId)
+      coupons.set(couponId, coupon)
+    }),
+  ])
+
+  // Step 4: process subscriptions with full pricing + discount data.
+  // Skip internal/demo accounts — they appear in Stripe but are excluded from Stripe's own MRR CSV.
+  const results: SubscriptionData[] = []
+  for (const sub of rawSubs) {
+    const customerId = typeof sub.customer === 'string' ? sub.customer : (sub.customer as Stripe.Customer).id
+    if (INTERNAL_CUSTOMER_IDS.has(customerId)) continue
+    const record = processSubscription(sub, rate, tieredPrices, coupons)
+    if (record) results.push(record)
+  }
   return results
+}
+
+/**
+ * Fetches active, trialing, and past_due subscriptions with customer and product details expanded.
+ * Matches Stripe's own MRR methodology: Stripe includes all three statuses in their MRR figure.
+ *
+ * Performance notes:
+ * - Fetches 3 statuses in parallel instead of status:'all' — skips thousands of cancelled subs
+ * - Results are cached for 60 s to prevent redundant calls when multiple functions run in parallel
+ */
+export async function getActiveSubscriptions(fxRate?: number): Promise<SubscriptionData[]> {
+  const rate = fxRate ?? await getUsdToCadRate()
+
+  if (_subsCache && Date.now() - _subsCache.ts < SUBS_CACHE_TTL_MS && _subsCache.fxRate === rate) {
+    return _subsCache.data
+  }
+
+  const [active, trialing, pastDue] = await Promise.all([
+    fetchByStatus('active', rate),
+    fetchByStatus('trialing', rate),
+    fetchByStatus('past_due', rate),
+  ])
+
+  const data = [...active, ...trialing, ...pastDue]
+  _subsCache = { data, fxRate: rate, ts: Date.now() }
+  return data
 }
 
 /**
@@ -159,20 +384,26 @@ export async function getKpis(fxRate?: number): Promise<KpiData> {
   const rate = fxRate ?? await getUsdToCadRate()
   const subs = await getActiveSubscriptions(rate)
 
-  const mrr = subs.reduce((sum, s) => sum + s.mrrCad, 0)
+  // MRR/ARR = active + past_due (excludes trialing only).
+  // Past_due is intentionally included: Vome accepts offline payments (manual transfers, cheques)
+  // so a Stripe payment failure does not mean the contract revenue is lost.
+  // Trialing is excluded and tracked separately as pipeline in trialingMrr/trialingArr.
+  // Note: Stripe's own dashboard excludes past_due, so our MRR will be ~$400 higher than Stripe's.
+  const paidSubs = subs.filter(s => s.status === 'active' || s.status === 'past_due')
+  const mrr = paidSubs.reduce((sum, s) => sum + s.mrrCad, 0)
   const arr = mrr * 12
-  const totalSeats = subs.reduce((sum, s) => sum + s.seats, 0)
+  const totalSeats = paidSubs.reduce((sum, s) => sum + s.seats, 0)
 
   // Split by native currency for FX transparency
-  const mrrCadNative = subs.filter(s => s.currency === 'cad').reduce((sum, s) => sum + s.mrrCad, 0)
-  const mrrUsdNative = subs.filter(s => s.currency === 'usd').reduce((sum, s) => sum + s.arrNative / 12, 0)
+  const mrrCadNative = paidSubs.filter(s => s.currency === 'cad').reduce((sum, s) => sum + s.mrrCad, 0)
+  const mrrUsdNative = paidSubs.filter(s => s.currency === 'usd').reduce((sum, s) => sum + s.arrNative / 12, 0)
 
   const byPlan = {} as Record<PlanTier, PlanSummary>
   for (const tier of PLAN_ORDER) {
     byPlan[tier] = { count: 0, arr: 0, mrr: 0, seats: 0 }
   }
 
-  for (const sub of subs) {
+  for (const sub of paidSubs) {
     byPlan[sub.plan].count++
     byPlan[sub.plan].arr += sub.arrCad
     byPlan[sub.plan].mrr += sub.mrrCad
@@ -183,12 +414,18 @@ export async function getKpis(fxRate?: number): Promise<KpiData> {
   const trialingSubscriptions = subs.filter(s => s.status === 'trialing').length
   const pastDueSubscriptions = subs.filter(s => s.status === 'past_due').length
 
+  const trialSubs = subs.filter(s => s.status === 'trialing')
+  const trialingMrr = trialSubs.reduce((sum, s) => sum + s.mrrCad, 0)
+  const trialingArr = trialingMrr * 12
+
   return {
     mrr,
     arr,
     activeSubscriptions,
     trialingSubscriptions,
     pastDueSubscriptions,
+    trialingMrr,
+    trialingArr,
     avgArrPerCustomer: activeSubscriptions > 0 ? arr / activeSubscriptions : 0,
     totalSeats,
     byPlan,

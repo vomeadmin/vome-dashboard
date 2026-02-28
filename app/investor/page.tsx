@@ -47,6 +47,12 @@ export default async function InvestorPage() {
     getChurnedDowngrades(thirtyDaysAgo, fxRate),
   ])
 
+  // Override current month with KPI MRR so the chart tip matches the KPI card.
+  // (Historical months use a simpler snapshot; KPI uses the accurate tiered/discount path.)
+  if (mrrTrend.length > 0) {
+    mrrTrend[mrrTrend.length - 1] = { ...mrrTrend[mrrTrend.length - 1], mrr: kpis.mrr }
+  }
+
   const churnCount = churnedDowngrades.length
   const arrLostToChurn = churnedDowngrades.reduce((sum: number, c) => sum + c.arrLostCad, 0)
 
@@ -63,8 +69,19 @@ export default async function InvestorPage() {
 
       {/* KPIs */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
-        <KpiCard label="ARR" value={formatCad(kpis.arr)} accent="positive" icon="▲" />
-        <KpiCard label="MRR" value={formatCad(kpis.mrr)} icon="◈" />
+        <KpiCard
+          label="ARR"
+          value={formatCad(kpis.arr)}
+          note={kpis.trialingSubscriptions > 0 ? `+ ${formatCad(kpis.trialingArr)} pipeline (${kpis.trialingSubscriptions} trials, excl. above)` : undefined}
+          accent="positive"
+          icon="▲"
+        />
+        <KpiCard
+          label="MRR"
+          value={formatCad(kpis.mrr)}
+          note={kpis.trialingSubscriptions > 0 ? `+ ${formatCad(kpis.trialingMrr)} pipeline (${kpis.trialingSubscriptions} trials, excl. above)` : undefined}
+          icon="◈"
+        />
         <KpiCard
           label="Active Subscriptions"
           value={kpis.activeSubscriptions.toString()}

@@ -2,12 +2,13 @@ interface KpiCardProps {
   label: string
   value: string
   subValue?: string
+  note?: string           // pipeline/context line shown in emerald below subValue
   trend?: number | null  // percentage change
   icon?: string
   accent?: 'default' | 'positive' | 'warning' | 'negative'
 }
 
-export function KpiCard({ label, value, subValue, trend, icon, accent = 'default' }: KpiCardProps) {
+export function KpiCard({ label, value, subValue, note, trend, icon, accent = 'default' }: KpiCardProps) {
   const accentColors = {
     default: 'border-indigo-500/30',
     positive: 'border-emerald-500/30',
@@ -39,6 +40,7 @@ export function KpiCard({ label, value, subValue, trend, icon, accent = 'default
           </span>
         )}
       </div>
+      {note && <span className="text-xs text-emerald-500/80 mt-0.5">{note}</span>}
     </div>
   )
 }
