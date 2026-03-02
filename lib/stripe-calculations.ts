@@ -3,6 +3,7 @@ import { stripe } from './stripe'
 import { getUsdToCadRate } from './fx'
 import { getPlanFromProduct, type PlanTier, PLAN_ORDER } from './plan-config'
 import { INTERNAL_CUSTOMER_IDS } from './internal-accounts'
+import { STRIPE_MRR_HISTORY } from './mrr-history'
 
 export interface SubscriptionData {
   id: string
@@ -22,6 +23,9 @@ export interface SubscriptionData {
   // Original native currency values (before FX conversion)
   arrNative: number
   nativeCurrency: string
+  city?: string
+  state?: string   // province/state code, e.g. 'AB', 'QC', 'MD'
+  country?: string // 2-letter ISO code
 }
 
 export interface PlanSummary {
@@ -35,6 +39,7 @@ export interface KpiData {
   mrr: number
   arr: number
   activeSubscriptions: number
+  uniqueActiveCustomers: number  // distinct customer IDs with active/past_due subs
   trialingSubscriptions: number  // NOT in MRR — shown as pipeline note
   pastDueSubscriptions: number   // INCLUDED in MRR — offline payments accepted
   trialingMrr: number  // MRR from trialing subs — already included in mrr total (Stripe methodology)
@@ -60,6 +65,9 @@ export interface CustomerData {
   currency: string
   renewalDate: Date
   subscriptionId: string
+  city?: string
+  state?: string   // province/state code, e.g. 'AB', 'QC', 'MD'
+  country?: string // 2-letter ISO code, e.g. 'CA', 'US'
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +281,9 @@ function processSubscription(
     mrrCad: arrCad / 12,
     arrNative: totalArrNative,
     nativeCurrency: currency.toUpperCase(),
+    city: customer.address?.city ?? undefined,
+    state: customer.address?.state ?? undefined,
+    country: customer.address?.country ?? undefined,
   }
 }
 
@@ -411,6 +422,7 @@ export async function getKpis(fxRate?: number): Promise<KpiData> {
   }
 
   const activeSubscriptions = subs.filter(s => s.status === 'active').length
+  const uniqueActiveCustomers = new Set(paidSubs.map(s => s.customerId)).size
   const trialingSubscriptions = subs.filter(s => s.status === 'trialing').length
   const pastDueSubscriptions = subs.filter(s => s.status === 'past_due').length
 
@@ -423,10 +435,11 @@ export async function getKpis(fxRate?: number): Promise<KpiData> {
     arr,
     activeSubscriptions,
     trialingSubscriptions,
+    uniqueActiveCustomers,
     pastDueSubscriptions,
     trialingMrr,
     trialingArr,
-    avgArrPerCustomer: activeSubscriptions > 0 ? arr / activeSubscriptions : 0,
+    avgArrPerCustomer: uniqueActiveCustomers > 0 ? arr / uniqueActiveCustomers : 0,
     totalSeats,
     byPlan,
     fxRate: rate,
@@ -467,6 +480,9 @@ export async function getTopCustomers(limit = 25, fxRate?: number): Promise<Cust
         currency: sub.currency,
         renewalDate: sub.currentPeriodEnd,
         subscriptionId: sub.id,
+        city: sub.city,
+        state: sub.state,
+        country: sub.country,
       })
     }
   }
@@ -543,143 +559,117 @@ export async function getMonthlyRevenueTrend(months = 12, fxRate?: number): Prom
 }
 
 /**
- * Returns monthly MRR snapshots for the past N months by reconstructing which subscriptions
- * were active at each month-end. Matches Stripe's ARR report methodology exactly:
- * subscription-based point-in-time snapshot, not invoice cash-flow spreading.
+ * Returns monthly MRR for the past N months using Stripe's official "Ending MRR" export data.
+ * Source: lib/mrr-history.ts (populated from the Stripe subscription metrics CSV).
  *
- * A subscription counts for a given month if:
- *   start_date < first-second-of-next-month  AND
- *   (ended_at is null OR ended_at >= first-second-of-next-month)
+ * Using the CSV directly means the chart matches Stripe's published figures exactly —
+ * no reconstruction drift, no FX discrepancies, no trial-period edge cases.
  *
- * Uses current subscription prices as a proxy for historical prices. Minor drift occurs only for
- * subscriptions that changed plan mid-period; overall accuracy closely tracks Stripe's dashboard.
+ * The caller should override the current month's entry with kpis.mrr for real-time accuracy
+ * (the CSV value for the current in-progress month is stale as of the last export date).
+ *
+ * To update: re-export "Subscription metrics (monthly)" from your Stripe dashboard and
+ * paste the new "Ending MRR" values into lib/mrr-history.ts.
  */
-export async function getNormalizedMrrByMonth(months = 24, fxRate?: number): Promise<
+export async function getNormalizedMrrByMonth(months = 24, _fxRate?: number): Promise<
   Array<{ monthKey: string; month: string; mrr: number }>
 > {
-  const rate = fxRate ?? await getUsdToCadRate()
   const now = new Date()
+  const result: Array<{ monthKey: string; month: string; mrr: number }> = []
 
-  // Build month buckets. monthEndTs = first second of NEXT month (exclusive upper bound).
-  // Using an exclusive bound means ended_at == monthEndTs is treated as "still active that month",
-  // which matches how Stripe records billing-period-end cancellations.
-  const buckets: Array<{ key: string; monthEndTs: number; label: string }> = []
   for (let i = months - 1; i >= 0; i--) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
-    const nextMonth = new Date(d.getFullYear(), d.getMonth() + 1, 1)
-    const monthEndTs = Math.floor(nextMonth.getTime() / 1000)
     const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
     const label = d.toLocaleDateString('en-CA', { month: 'short', year: '2-digit' })
-    buckets.push({ key, monthEndTs, label })
+    const mrr = STRIPE_MRR_HISTORY[key] ?? 0
+    result.push({ monthKey: key, month: label, mrr })
   }
 
-  // Fetch all subscriptions (active + cancelled). Same expand as getActiveSubscriptions.
-  // Skip incomplete/incomplete_expired — those never billed and have no revenue.
-  const allSubs: Stripe.Subscription[] = []
-  for await (const sub of stripe.subscriptions.list({
-    status: 'all',
-    limit: 100,
-    expand: ['data.items.data.price'],
-  })) {
-    if (['incomplete', 'incomplete_expired'].includes(sub.status)) continue
-    allSubs.push(sub)
-  }
-
-  // For each month bucket, sum MRR from subscriptions active at that month-end snapshot.
-  return buckets.map(({ key, monthEndTs, label }) => {
-    let totalMrr = 0
-    for (const sub of allSubs) {
-      if (sub.start_date >= monthEndTs) continue          // subscription hadn't started yet
-      if (sub.ended_at && sub.ended_at < monthEndTs) continue  // subscription had already ended
-
-      for (const item of sub.items.data) {
-        const price = item.price as Stripe.Price
-        // Skip non-recurring items (one-time charges attached to subscription)
-        // Without this guard, price.recurring?.interval defaults to 'month' and
-        // a $10K annual charge would be treated as $10K/month MRR (12× inflation).
-        if (!price.recurring) continue
-        const unitAmount = price.unit_amount ?? 0
-        if (unitAmount <= 0) continue  // skip $0 add-ons, matches getKpis behaviour
-        const seats = item.quantity ?? 1
-        const interval = price.recurring.interval
-        const intervalCount = price.recurring.interval_count ?? 1
-        const monthsInPeriod = interval === 'year' ? 12 * intervalCount : intervalCount
-        const mrrNative = ((unitAmount / 100) * seats) / monthsInPeriod
-        const currency = (price.currency ?? sub.currency).toLowerCase()
-        const mrrCad = currency === 'usd' ? mrrNative * rate : mrrNative
-        totalMrr += mrrCad
-      }
-    }
-    return { monthKey: key, month: label, mrr: totalMrr }
-  })
+  return result
 }
 
 /**
- * Detects paid → Free/Recruit downgrades using Stripe subscription update events.
+ * Detects true customer churn: a paying subscriber whose subscription was cancelled
+ * within the given date window (filtered by canceled_at).
+ *
+ * Uses stripe.subscriptions.list (not the Events API) so historical quarters work —
+ * the Events API only retains data for 30 days.
+ *
+ * A cancellation counts as churn if:
+ *  - canceled_at falls within [sinceDate, untilDate]
+ *  - the subscription was not cancelled during its trial period (never actually paid)
+ *  - the plan was a paid tier
+ *  - the customer is not an internal/demo account
+ * Each customer is counted at most once per window (deduplicated by customer ID).
  */
 export async function getChurnedDowngrades(
   sinceDate: Date,
-  fxRate?: number
+  fxRate?: number,
+  untilDate?: Date
 ): Promise<Array<{ customerName: string; fromPlan: PlanTier; date: Date; arrLostCad: number }>> {
   const rate = fxRate ?? await getUsdToCadRate()
   const results: Array<{ customerName: string; fromPlan: PlanTier; date: Date; arrLostCad: number }> = []
+  const sinceTs = Math.floor(sinceDate.getTime() / 1000)
+  const untilTs = untilDate ? Math.floor(untilDate.getTime() / 1000) : Math.floor(Date.now() / 1000)
+  const countedCustomers = new Set<string>()
 
-  for await (const event of stripe.events.list({
-    type: 'customer.subscription.updated',
-    created: { gte: Math.floor(sinceDate.getTime() / 1000) },
-    limit: 100,
-  })) {
-    const newSub = event.data.object as Stripe.Subscription
-    const prevSub = event.data.previous_attributes as Partial<Stripe.Subscription>
+  for await (const sub of stripe.subscriptions.list({ status: 'canceled', limit: 100 })) {
+    const canceledAt = sub.canceled_at
+    if (!canceledAt) continue
+    if (canceledAt < sinceTs || canceledAt > untilTs) continue
 
-    if (!prevSub?.items) continue
+    // Skip if cancelled during the trial period — subscription was never actually paid
+    if (sub.trial_end != null && canceledAt <= sub.trial_end) continue
 
-    const prevItem = (prevSub.items as Stripe.ApiList<Stripe.SubscriptionItem>)?.data?.[0]
-    const newItem = newSub.items.data[0]
+    const item = sub.items.data[0]
+    if (!item) continue
 
-    if (!prevItem || !newItem) continue
-
-    const prevPrice = prevItem.price as Stripe.Price
-    const newPrice = newItem.price as Stripe.Price
-
-    const prevProduct = prevPrice?.product
-    const newProduct = newPrice?.product
-
-    const prevPlan = getPlanFromProduct(
-      typeof prevProduct === 'string' ? prevProduct : (prevProduct as Stripe.Product)?.id ?? null,
-      typeof prevProduct === 'object' ? (prevProduct as Stripe.Product)?.name : null
+    const price = item.price as Stripe.Price
+    const product = price?.product
+    const plan = getPlanFromProduct(
+      typeof product === 'string' ? product : (product as Stripe.Product)?.id ?? null,
+      typeof product === 'object' ? (product as Stripe.Product)?.name : null
     )
-    const newPlan = getPlanFromProduct(
-      typeof newProduct === 'string' ? newProduct : (newProduct as Stripe.Product)?.id ?? null,
-      typeof newProduct === 'object' ? (newProduct as Stripe.Product)?.name : null
-    )
+    if (plan === 'Free') continue
 
-    const wasPaid = prevPlan !== 'Free'
-    const isNowFree = newPlan === 'Free'
+    const customerId = sub.customer as string
+    if (INTERNAL_CUSTOMER_IDS.has(customerId)) continue
+    if (countedCustomers.has(customerId)) continue
 
-    if (wasPaid && isNowFree) {
-      const customer = await stripe.customers.retrieve(newSub.customer as string)
-      const prevSeats = prevItem.quantity ?? 1
-      const prevUnitCents = prevPrice?.unit_amount ?? 0
-      const prevInterval = (prevPrice?.recurring?.interval ?? 'month') as 'month' | 'year'
-      const prevIntervalCount = prevPrice?.recurring?.interval_count ?? 1
-      const prevAnnualNative =
-        prevInterval === 'year'
-          ? (prevUnitCents / 100) * prevSeats / prevIntervalCount
-          : (prevUnitCents / 100) * prevSeats * 12
-      const arrLostCad =
-        newSub.currency === 'usd' ? prevAnnualNative * rate : prevAnnualNative
+    // Verify no remaining active or past_due subscriptions — this customer truly left.
+    // Safe to check here because this function is only called for the current quarter;
+    // past quarters use static CSV data for retention metrics.
+    const [otherActive, otherPastDue] = await Promise.all([
+      stripe.subscriptions.list({ customer: customerId, status: 'active', limit: 2 }),
+      stripe.subscriptions.list({ customer: customerId, status: 'past_due', limit: 2 }),
+    ])
+    if (otherActive.data.length > 0 || otherPastDue.data.length > 0) continue
 
-      results.push({
-        customerName:
-          (customer as Stripe.Customer).name ??
-          (customer as Stripe.Customer).email ??
-          newSub.customer as string,
-        fromPlan: prevPlan,
-        date: new Date(event.created * 1000),
-        arrLostCad,
-      })
-    }
+    countedCustomers.add(customerId)
+
+    const seats = item.quantity ?? 1
+    const unitCents =
+      price?.unit_amount != null
+        ? price.unit_amount
+        : Math.round(parseFloat(price?.unit_amount_decimal ?? '0'))
+    const interval = (price?.recurring?.interval ?? 'month') as 'month' | 'year'
+    const intervalCount = price?.recurring?.interval_count ?? 1
+    const annualNative =
+      interval === 'year'
+        ? (unitCents / 100) * seats / intervalCount
+        : (unitCents / 100) * seats * 12
+    const arrLostCad = sub.currency === 'usd' ? annualNative * rate : annualNative
+
+    const customer = await stripe.customers.retrieve(customerId)
+    results.push({
+      customerName:
+        (customer as Stripe.Customer).name ??
+        (customer as Stripe.Customer).email ??
+        customerId,
+      fromPlan: plan,
+      date: new Date(canceledAt * 1000),
+      arrLostCad,
+    })
   }
 
   return results

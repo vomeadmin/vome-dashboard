@@ -24,16 +24,14 @@ export default async function DashboardPage() {
     await Promise.all([
       getKpis(fxRate),
       getUpcomingRenewals(90, fxRate),
-      getNormalizedMrrByMonth(24, fxRate),
+      getNormalizedMrrByMonth(36, fxRate),
       getCashFlowForecast(fxRate),
       getTopCustomers(5, fxRate),
       getChurnedDowngrades(thirtyDaysAgo, fxRate),
     ])
 
-  // Override current month with the KPI MRR (getKpis uses the accurate path: tiered pricing,
-  // unit_amount_decimal fallback, and discount coupons). getNormalizedMrrByMonth uses a simpler
-  // historical snapshot approach that misses these — so the last bucket would otherwise show a
-  // different number than the KPI card.
+  // The CSV export is a point-in-time snapshot — override the current in-progress month
+  // with the live kpis.mrr so the chart tip always reflects today's real-time figure.
   if (mrrTrend.length > 0) {
     mrrTrend[mrrTrend.length - 1] = { ...mrrTrend[mrrTrend.length - 1], mrr: kpis.mrr }
   }

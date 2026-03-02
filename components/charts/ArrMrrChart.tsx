@@ -88,7 +88,7 @@ function toQuarterly(data: MrrDataPoint[]): MrrDataPoint[] {
 }
 
 export function ArrMrrChart({ data, mode = 'mrr', subtitle }: ArrMrrChartProps) {
-  const [view, setView] = useState<'monthly' | 'quarterly'>('monthly')
+  const [view, setView] = useState<'monthly' | 'quarterly'>('quarterly')
 
   const multiplier = mode === 'arr' ? 12 : 1
   const label = mode === 'arr' ? 'ARR' : 'MRR'
@@ -138,24 +138,24 @@ export function ArrMrrChart({ data, mode = 'mrr', subtitle }: ArrMrrChartProps) 
         </div>
         <div className="flex rounded-md border border-slate-700 overflow-hidden text-xs">
           <button
-            onClick={() => setView('monthly')}
-            className={`px-3 py-1.5 font-medium transition-colors ${
-              view === 'monthly'
-                ? 'bg-slate-700 text-slate-100'
-                : 'text-slate-400 hover:text-slate-300'
-            }`}
-          >
-            Monthly
-          </button>
-          <button
             onClick={() => setView('quarterly')}
-            className={`px-3 py-1.5 font-medium transition-colors border-l border-slate-700 ${
+            className={`px-3 py-1.5 font-medium transition-colors ${
               view === 'quarterly'
                 ? 'bg-slate-700 text-slate-100'
                 : 'text-slate-400 hover:text-slate-300'
             }`}
           >
             Quarterly
+          </button>
+          <button
+            onClick={() => setView('monthly')}
+            className={`px-3 py-1.5 font-medium transition-colors border-l border-slate-700 ${
+              view === 'monthly'
+                ? 'bg-slate-700 text-slate-100'
+                : 'text-slate-400 hover:text-slate-300'
+            }`}
+          >
+            Monthly
           </button>
         </div>
       </div>
